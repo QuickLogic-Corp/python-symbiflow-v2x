@@ -330,8 +330,12 @@ def metadata_for_fasm_lut(yj, parent, children):
 
     # "fasm_lut" metadata
     feature = parent.attr("FASM_LUT")
-    if not feature or isinstance(feature, int):
+    try:
+        # Use "INIT" FASM feature if the attribute is set to an integer.
+        feature = int(feature)
         feature = "INIT"
+    except ValueError:
+        pass
 
     # Single LUT
     if len(children_data) == 1:
@@ -478,6 +482,37 @@ def net_and_pin_attrs(yj, mod, driver: CellPin, sink: CellPin, netid: int):
     return net_attrs
 
 
+def add_pack_pattern(parent, driver, sink, path_attr):
+    """
+    Attaches a pack pattern to either <direct> or <mux> XML element.
+    """
+
+    # Regular pack pattern
+    pack = path_attr.get('pack', path_attr.get('PACK', None))
+    if pack is not None:
+        for pack_name in pack.split(";"):
+            pp_xml = ET.SubElement(
+                parent, 'pack_pattern', {
+                    'name': pack_name,
+                    'type': 'pack'
+                }
+            )
+            create_port(pp_xml, driver, "input")
+            create_port(pp_xml, sink, "output")
+
+    # Carry-chain pack pattern
+    carry_name = path_attr.get('carry', None)
+    if carry_name:
+        pp_xml = ET.SubElement(
+            parent, 'pack_pattern', {
+                'name': carry_name,
+                'type': 'carry'
+            }
+        )
+        create_port(pp_xml, driver, "input")
+        create_port(pp_xml, sink, "output")
+
+
 def make_direct_conn(
         ic_xml: ET.Element, driver: CellPin, sink: CellPin, path_attr: dict
 ) -> ET.Element:
@@ -486,45 +521,35 @@ def make_direct_conn(
     create_port(dir_xml, sink, "output")
 
     # Pack patterns
-    pack = path_attr.get('pack', path_attr.get('PACK', None))
-    if pack is not None:
-        for pack_name in pack.split(";"):
-            pp_xml = ET.SubElement(
-                dir_xml, 'pack_pattern', {
-                    'name': pack_name,
-                    'type': 'pack'
-                }
-            )
-            create_port(pp_xml, driver, "input")
-            create_port(pp_xml, sink, "output")
-
-    carry_name = path_attr.get('carry', None)
-    if carry_name:
-        pp_xml = ET.SubElement(
-            dir_xml, 'pack_pattern', {
-                'name': carry_name,
-                'type': 'carry'
-            }
-        )
-        create_port(pp_xml, driver, "input")
-        create_port(pp_xml, sink, "output")
+    add_pack_pattern(dir_xml, driver, sink, path_attr)
 
     return dir_xml
 
 
 def make_mux_conn(
-        ic_xml: ET.Element, mux_name: str, mux_inputs: Dict[CellPin, CellPin],
-        mux_outputs: Dict[CellPin, List[CellPin]]
+        ic_xml: ET.Element, mux_name: str,
+        mux_inputs: Dict[CellPin, CellPin],
+        mux_outputs: Dict[CellPin, List[CellPin]],
+        annotate_fasm: bool
 ) -> ET.Element:
 
     mux_xml = ET.SubElement(ic_xml, "mux", {"name": mux_name})
-    for mux_input, driver in mux_inputs.items():
-        create_port(mux_xml, driver, "input", metadata={'fasm_mux': mux_input})
+    for mux_input, (driver, path_attr,) in mux_inputs.items():
+        if annotate_fasm:
+            metadata = {'fasm_mux': mux_input}
+        else:
+            metadata = None
+        create_port(mux_xml, driver, "input", metadata=metadata)
+
     assert len(mux_outputs) == 1, mux_outputs
     for mux_pin, sinks in mux_outputs.items():
         assert len(sinks) == 1, sinks
-        for sink_pin, path_attr in sinks:
+        for sink_pin, sink_path_attr in sinks:
             create_port(mux_xml, sink_pin, "output")
+
+            # Create pack patterns
+            for mux_input, (driver, driver_path_attr,) in mux_inputs.items():
+                add_pack_pattern(mux_xml, driver, sink_pin, driver_path_attr)
 
     #  <metadata>
     meta_root = ET.SubElement(mux_xml, 'metadata')
@@ -961,6 +986,11 @@ def make_container_pb(
 
     # Generate the mux interconnects
     for mux_cell in routing_cells:
+
+        # Check whether we should annotate the mux with FASM
+        cell_attrs = mod.cell_attrs(mux_cell)
+        annotate_fasm = int(cell_attrs.get("FASM", "0")) != 0
+
         mux_outputs = defaultdict(list)
         for (driver_cell, driver_pin), sinks in interconn.items():
             if driver_cell != mux_cell:
@@ -987,9 +1017,21 @@ Mux {}.{} is trying to drive mux input pin {}.{}""".format(
 
         mux_inputs = {}
         for (driver_cell, driver_pin), sinks in interconn.items():
-            for (sink_cell, mux_pin), path_attr in sinks:
+            is_forking = len(sinks) > 1
+
+            for (sink_cell, sink_pin), path_attr in sinks:
+                attrs = dict(**path_attr)
+
                 if sink_cell != mux_cell:
                     continue
+
+                # If the driving net is forking then remove all pack-patterns
+                # from the mux.
+                if is_forking:
+                    for a in ["pack", "PACK", "carry"]:
+                        if a in attrs:
+                            del attrs[a]
+
                 assert driver_cell not in routing_cells, \
                     "Mux {}.{} is trying to drive mux {}.{}".format(
                         driver_cell, driver_pin, mux_cell, sink_pin
@@ -997,12 +1039,12 @@ Mux {}.{} is trying to drive mux input pin {}.{}""".format(
                 assert sink_pin not in mux_inputs, """\
 Pin {}.{} is trying to drive mux pin {}.{} (already driving by {}.{})\
                  """.format(
-                    driver_cell, driver_pin, mux_cell, mux_pin,
+                    driver_cell, driver_pin, mux_cell, sink_pin,
                     *mux_inputs[sink_pin]
                 )
-                mux_inputs[mux_pin] = (driver_cell, driver_pin)
+                mux_inputs[sink_pin] = ((driver_cell, driver_pin), attrs)
 
-        make_mux_conn(ic_xml, mux_cell, mux_inputs, mux_outputs)
+        make_mux_conn(ic_xml, mux_cell, mux_inputs, mux_outputs, annotate_fasm)
 
 
 def make_leaf_pb(outfile, yj, mod, mod_pname, pb_type_xml):
